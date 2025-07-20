@@ -4,13 +4,13 @@ A Node.js library for generating and sending ICP (Internet Computer Protocol) tr
 
 ## Features
 
-- ✅ Send ICP transactions using private keys
-- ✅ Support for both local and mainnet networks
-- ✅ Generate new Ed25519 key pairs
-- ✅ Check account balances
-- ✅ Cross-platform compatibility
-- ✅ Comprehensive error handling
-- ✅ Supports both AccountIdentifier and Principal addresses
+- Send ICP transactions using private keys
+- Support for both local and mainnet networks
+- Generate new Ed25519 key pairs
+- Check account balances
+- Cross-platform compatibility
+- Comprehensive error handling
+- Supports both AccountIdentifier and Principal addresses
 
 ## Installation
 

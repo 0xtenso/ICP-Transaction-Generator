@@ -1,12 +1,11 @@
-import { HttpAgent } from '@dfinity/agent';
-import { Ed25519KeyIdentity } from '@dfinity/identity';
+import { HttpAgent, Actor } from '@dfinity/agent';
+import { Secp256k1KeyIdentity } from '@dfinity/identity-secp256k1';
 import { Principal } from '@dfinity/principal';
 import { createInterface } from 'readline/promises';
-import ledgerPkg from '@dfinity/ledger-icp';
-const { AccountIdentifier, LedgerCanister } = ledgerPkg;
+import { LedgerCanister, AccountIdentifier } from '@dfinity/ledger-icp';
 
 export class ICPTransactionGenerator {
-  constructor(network = 'local') {
+  constructor(network = 'mainnet') {
     this.network = network;
     this.agent = null;
     this.ledger = null;
@@ -46,8 +45,8 @@ export class ICPTransactionGenerator {
   }
 
   /**
-   * @param {string} privateKeyHex - Private key in hex format (64 characters)
-   * @returns {Ed25519KeyIdentity} Identity object
+   * @param {string} privateKeyHex - Private key in hex format (64 characters for secp256k1)
+   * @returns {Secp256k1KeyIdentity} Identity object
    */
   createIdentityFromPrivateKey(privateKeyHex) {
     if (!privateKeyHex || typeof privateKeyHex !== 'string') {
@@ -64,13 +63,21 @@ export class ICPTransactionGenerator {
       cleanHex.match(/.{1,2}/g).map(byte => parseInt(byte, 16))
     );
 
-    return Ed25519KeyIdentity.fromSecretKey(privateKeyBytes);
+    console.log('Creating secp256k1 identity from private key');
+
+    try {
+      const identity = Secp256k1KeyIdentity.fromSecretKey(privateKeyBytes);
+      console.log('Successfully created secp256k1 identity');
+      return identity;
+    } catch (error) {
+      throw new Error(`Failed to create secp256k1 identity: ${error.message}`);
+    }
   }
 
   /**
    * Validate and parse receiver address
    * @param {string} receiverAddress - AccountIdentifier or Principal
-   * @returns {AccountIdentifier} Validated account identifier
+   * @returns {Object} Object with both Principal and AccountIdentifier for compatibility
    */
   parseReceiverAddress(receiverAddress) {
     if (!receiverAddress || typeof receiverAddress !== 'string') {
@@ -79,17 +86,38 @@ export class ICPTransactionGenerator {
 
     const trimmedAddress = receiverAddress.trim();
 
-    // Try AccountIdentifier format (64 hex characters)
-    if (trimmedAddress.length === 64 && /^[0-9a-fA-F]+$/.test(trimmedAddress)) {
-      return AccountIdentifier.fromHex(trimmedAddress);
+    // Try Principal format first
+    try {
+      const principal = Principal.fromText(trimmedAddress);
+      // Convert Principal to AccountIdentifier for legacy compatibility
+      const accountIdentifier = AccountIdentifier.fromPrincipal({
+        principal: principal,
+        subAccount: undefined
+      });
+      
+      return {
+        principal: principal,
+        accountIdentifier: accountIdentifier,
+        type: 'principal'
+      };
+    } catch (principalError) {
+      // Try AccountIdentifier format (64 hex characters)
+      if (trimmedAddress.length === 64 && /^[0-9a-fA-F]+$/.test(trimmedAddress)) {
+        try {
+          const accountIdentifier = AccountIdentifier.fromHex(trimmedAddress);
+          
+          return {
+            principal: null, // Cannot reliably convert AccountIdentifier back to Principal
+            accountIdentifier: accountIdentifier,
+            type: 'accountIdentifier'
+          };
+        } catch (accountError) {
+          throw new Error(`Invalid AccountIdentifier format: ${accountError.message}`);
+        }
+      }
+      
+      throw new Error(`Invalid receiver address format. Expected Principal (e.g., "rdmx6-jaaaa-aaaaa-aaadq-cai") or AccountIdentifier (64 hex characters). Error: ${principalError.message}`);
     }
-    
-    // Try Principal format
-    const principal = Principal.fromText(trimmedAddress);
-    return AccountIdentifier.fromPrincipal({
-      principal: principal,
-      subAccount: undefined
-    });
   }
 
   /**
@@ -126,7 +154,7 @@ export class ICPTransactionGenerator {
 
   /**
    * Get account identifier from identity
-   * @param {Ed25519KeyIdentity} identity - Identity object
+   * @param {Secp256k1KeyIdentity} identity - Secp256k1 identity object
    * @returns {string} Account identifier hex string
    */
   getAccountIdentifier(identity) {
@@ -139,128 +167,216 @@ export class ICPTransactionGenerator {
   }
 
   /**
-   * Create and send ICP transaction
+   * Create and send ICP transaction using LedgerCanister
    * @param {string} privateKeyHex - Sender's private key in hex
-   * @param {string} receiverAddress - Receiver's address (AccountIdentifier or Principal)
+   * @param {string} receiverAddress - Receiver's Principal or AccountIdentifier
    * @param {number|string} amount - Amount to send in ICP
    * @param {string|number} memo - Optional memo (default: current timestamp)
    * @returns {Promise<Object>} Transaction result
    */
   async sendTransaction(privateKeyHex, receiverAddress, amount, memo = null) {
-    if (!this.ledger) {
-      throw new Error('Ledger not initialized. Call init() first.');
-    }
-
-    console.log('Starting ICP transaction...');
+    console.log('Starting ICP transaction using LedgerCanister...');
     
     // Create identity and get accounts
     const senderIdentity = this.createIdentityFromPrivateKey(privateKeyHex);
     const senderAccountId = this.getAccountIdentifier(senderIdentity);
-    const receiverAccountId = this.parseReceiverAddress(receiverAddress);
+    const receiver = this.parseReceiverAddress(receiverAddress);
     
     console.log(`Sender: ${senderAccountId}`);
-    console.log(`Receiver: ${receiverAccountId.toHex()}`);
+    console.log(`Receiver: ${receiver.principal ? receiver.principal.toString() : receiver.accountIdentifier.toHex()}`);
+    console.log(`Receiver type: ${receiver.type}`);
     
-    // Convert amount and check balance
+    // Convert amount and validate
     const amountE8s = this.icpToE8s(amount);
     const transferFee = BigInt(10_000);
     const totalRequired = amountE8s + transferFee;
     
-    const senderBalance = await this.getBalance(senderAccountId);
     console.log(`Amount: ${amount} ICP, Fee: 0.0001 ICP, Total: ${(Number(totalRequired) / 100_000_000)} ICP`);
     
-    if (senderBalance < totalRequired) {
-      throw new Error(
-        `Insufficient balance. Required: ${totalRequired} e8s, Available: ${senderBalance} e8s`
-      );
+    // Check balance if ledger is available
+    if (this.ledger) {
+      try {
+        const senderBalance = await this.getBalance(senderAccountId);
+        if (senderBalance < totalRequired) {
+          throw new Error(
+            `Insufficient balance. Required: ${totalRequired} e8s, Available: ${senderBalance} e8s`
+          );
+        }
+        console.log(`✓ Balance check passed. Available: ${senderBalance} e8s`);
+      } catch (error) {
+        console.warn('Could not check balance, proceeding with transaction:', error.message);
+      }
     }
     
-    // Create authenticated agent and ledger
-    const authenticatedAgent = new HttpAgent({
+    // Create authenticated agent with sender identity
+    const agent = new HttpAgent({
       host: this.network === 'mainnet' ? 'https://ic0.app' : 'http://127.0.0.1:4943',
       identity: senderIdentity
     });
     
     if (this.network === 'local') {
-      await authenticatedAgent.fetchRootKey();
+      await agent.fetchRootKey();
     }
     
-    const authenticatedLedger = LedgerCanister.create({
-      agent: authenticatedAgent,
-      canisterId: Principal.fromText('ryjl3-tyaaa-aaaaa-aaaba-cai')
+    // Create authenticated ledger canister
+    const ledger = LedgerCanister.create({
+      agent,
+      canisterId: Principal.fromText('ryjl3-tyaaa-aaaaa-aaaba-cai') // ICP Ledger Canister ID
     });
     
-    // Execute transfer
-    const transferParams = {
-      to: receiverAccountId,
-      amount: amountE8s,
-      fee: transferFee,
-      memo: memo ? BigInt(memo) : BigInt(Date.now()),
-      fromSubaccount: undefined,
-      createdAtTime: undefined
+    // Prepare memo - handle empty strings and null values
+    let memoValue = BigInt(Date.now()); // Default to timestamp
+    
+    console.log('Processing memo input:', { memo, type: typeof memo, value: memo });
+    
+    try {
+      if (memo !== null && memo !== undefined && memo !== '') {
+        if (typeof memo === 'string') {
+          const trimmedMemo = memo.trim();
+          if (trimmedMemo !== '') {
+            const numericMemo = parseInt(trimmedMemo, 10);
+            if (!isNaN(numericMemo) && numericMemo >= 0) {
+              memoValue = BigInt(numericMemo);
+              console.log('Using custom memo:', memoValue.toString());
+            } else {
+              console.warn(`Invalid memo value "${memo}", using timestamp`);
+            }
+          }
+        } else if (typeof memo === 'number' && memo >= 0 && Number.isInteger(memo)) {
+          memoValue = BigInt(memo);
+          console.log('Using numeric memo:', memoValue.toString());
+        }
+      } else {
+        console.log('No memo provided, using timestamp:', memoValue.toString());
+      }
+    } catch (error) {
+      console.warn(`Error processing memo: ${error.message}, using timestamp`);
+      memoValue = BigInt(Date.now());
+    }
+    
+    // Execute transfer using LedgerCanister
+    console.log('Executing transfer with LedgerCanister...');
+    
+    // Prepare transfer arguments using LedgerCanister's expected format
+    const transferArgs = {
+      to: receiver.accountIdentifier,
+      amount: Number(amountE8s),
+      fee: Number(transferFee),
+      memo: Number(memoValue),
+      from_subaccount: null,
+      created_at_time: null
     };
     
-    console.log('Executing transfer...');
-    const transferResult = await authenticatedLedger.transfer(transferParams);
+    console.log('Transfer arguments prepared:');
+    console.log('- to (AccountIdentifier):', receiver.accountIdentifier.toHex());
+    console.log('- amount (e8s):', Number(amountE8s), typeof Number(amountE8s));
+    console.log('- fee (e8s):', Number(transferFee), typeof Number(transferFee));
+    console.log('- memo:', Number(memoValue), typeof Number(memoValue));
+    console.log('- from_subaccount:', transferArgs.from_subaccount);
+    console.log('- created_at_time:', transferArgs.created_at_time);
     
-    if ('Ok' in transferResult) {
-      const blockIndex = transferResult.Ok;
-      console.log(`Transaction successful! Block: ${blockIndex}`);
+    try {
+      console.log('Calling ledger.transfer...');
+      const transferResult = await ledger.transfer(transferArgs);
       
-      return {
-        success: true,
-        blockIndex: blockIndex.toString(),
-        senderAccount: senderAccountId,
-        receiverAccount: receiverAccountId.toHex(),
-        amount: amount.toString(),
-        amountE8s: amountE8s.toString(),
-        fee: transferFee.toString(),
-        memo: transferParams.memo.toString(),
-        network: this.network,
-        timestamp: new Date().toISOString()
-      };
-    } else {
-      const error = transferResult.Err;
-      let errorMessage = 'Transfer failed: ';
+      console.log('Transfer result received:', transferResult, typeof transferResult);
       
-      if ('BadFee' in error) {
-        errorMessage += `Bad fee. Expected: ${error.BadFee.expected_fee}`;
-      } else if ('InsufficientFunds' in error) {
-        errorMessage += `Insufficient funds. Balance: ${error.InsufficientFunds.balance}`;
-      } else if ('TxTooOld' in error) {
-        errorMessage += 'Transaction too old';
-      } else if ('TxCreatedInFuture' in error) {
-        errorMessage += 'Transaction created in future';
-      } else if ('TxDuplicate' in error) {
-        errorMessage += `Duplicate transaction. Block: ${error.TxDuplicate.duplicate_of}`;
+      // Handle different response formats
+      let blockIndex;
+      let isSuccess = false;
+      
+      if (typeof transferResult === 'number' || typeof transferResult === 'bigint') {
+        // Direct block index response (successful transfer)
+        blockIndex = transferResult;
+        isSuccess = true;
+        console.log(`Transfer successful! Block index: ${blockIndex}`);
+      } else if (transferResult && typeof transferResult === 'object') {
+        // Result object with Ok/Err variants
+        if ('Ok' in transferResult) {
+          blockIndex = transferResult.Ok;
+          isSuccess = true;
+          console.log(`Transfer successful! Block index: ${blockIndex}`);
+        } else if ('Err' in transferResult) {
+          const error = transferResult.Err;
+          let errorMessage = 'Transfer failed: ';
+          
+          if ('BadFee' in error) {
+            errorMessage += `Bad fee. Expected: ${error.BadFee.expected_fee}`;
+          } else if ('InsufficientFunds' in error) {
+            errorMessage += `Insufficient funds. Balance: ${error.InsufficientFunds.balance}`;
+          } else if ('TxTooOld' in error) {
+            errorMessage += 'Transaction too old';
+          } else if ('TxCreatedInFuture' in error) {
+            errorMessage += 'Transaction created in future';
+          } else if ('TxDuplicate' in error) {
+            errorMessage += `Duplicate transaction. Block: ${error.TxDuplicate.duplicate_of}`;
+          } else {
+            errorMessage += JSON.stringify(error);
+          }
+          
+          throw new Error(errorMessage);
+        } else {
+          throw new Error(`Unknown result format: ${JSON.stringify(transferResult)}`);
+        }
       } else {
-        errorMessage += JSON.stringify(error);
+        throw new Error(`Unexpected result type: ${typeof transferResult}, value: ${transferResult}`);
       }
       
-      throw new Error(errorMessage);
+      if (isSuccess) {
+        return {
+          success: true,
+          blockIndex: blockIndex.toString(),
+          senderAccount: senderAccountId,
+          receiverAccount: receiver.principal ? receiver.principal.toString() : receiver.accountIdentifier.toHex(),
+          receiverType: receiver.type,
+          amount: amount.toString(),
+          amountE8s: amountE8s.toString(),
+          fee: transferFee.toString(),
+          memo: Number(memoValue).toString(),
+          network: this.network,
+          timestamp: new Date().toISOString(),
+          transferType: 'LedgerCanister'
+        };
+      }
+    } catch (error) {
+      if (error.message && error.message.includes('Transfer failed')) {
+        throw error; // Re-throw our formatted error
+      } else {
+        throw new Error(`LedgerCanister transfer error: ${error.message}`);
+      }
     }
   }
 
   /**
-   * Generate a new Ed25519 key pair
+   * Generate a new secp256k1 key pair
    * @returns {Object} Key pair with private and public keys
    */
   generateKeyPair() {
-    const identity = Ed25519KeyIdentity.generate();
+    const identity = Secp256k1KeyIdentity.generate();
     const keyPair = identity.getKeyPair();
     
     const privateKey = Array.from(keyPair.secretKey)
       .map(b => b.toString(16).padStart(2, '0'))
       .join('');
-    const publicKey = Array.from(keyPair.publicKey)
-      .map(b => b.toString(16).padStart(2, '0'))
-      .join('');
+    
+    let publicKey;
+    try {
+      // For secp256k1, get the public key from the identity
+      const pubKey = identity.getPublicKey();
+      publicKey = Array.from(pubKey.toDer())
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
+    } catch (error) {
+      console.warn('Could not extract public key:', error.message);
+      publicKey = '';
+    }
     
     return {
       privateKey: `0x${privateKey}`,
       publicKey: `0x${publicKey}`,
       principal: identity.getPrincipal().toString(),
-      accountIdentifier: this.getAccountIdentifier(identity)
+      accountIdentifier: this.getAccountIdentifier(identity),
+      curve: 'secp256k1'
     };
   }
 }
@@ -321,8 +437,8 @@ if (process.argv[1]?.endsWith('transaction-generator.js') ||
       console.log('ICP Transaction Generator');
       
       // Get network choice
-      const network = await rl.question('Network (local/mainnet) [local]: ');
-      let selectedNetwork = network.trim() || 'local';
+      const network = await rl.question('Network (local/mainnet) [mainnet]: ');
+      let selectedNetwork = network.trim() || 'mainnet';
       
       // Initialize generator
       const generator = new ICPTransactionGenerator(selectedNetwork);
@@ -335,7 +451,7 @@ if (process.argv[1]?.endsWith('transaction-generator.js') ||
         if (selectedNetwork === 'local' && error.message.includes('Cannot connect to local IC environment')) {
           console.error(`\n${error.message}`);
           
-          const switchToMainnet = await rl.question('\nWould you like to use mainnet instead? (y/n) [n]: ');
+          const switchToMainnet = await rl.question('\nWould you like to use mainnet instead? (y/n) [y]: ');
           if (switchToMainnet.toLowerCase().trim() === 'y' || switchToMainnet.toLowerCase().trim() === 'yes') {
             selectedNetwork = 'mainnet';
             generator.network = 'mainnet';
@@ -353,14 +469,35 @@ if (process.argv[1]?.endsWith('transaction-generator.js') ||
       // Get transaction details
       console.log('\nEnter transaction details:');
       
-      const privateKey = await promptForPassword('Sender private key (hex): ');
+      const privateKey = await rl.question('Sender private key (hex): ');
       if (!privateKey.trim()) {
         throw new Error('Private key is required');
       }
       
+      // Validate private key format
+      const cleanPrivateKey = privateKey.trim().replace(/^0x/, '');
+      if (cleanPrivateKey.length !== 64 || !/^[0-9a-fA-F]+$/.test(cleanPrivateKey)) {
+        throw new Error('Private key must be 64 hex characters (32 bytes). Example: 6239bd6982d3869a7d11a540bcc68dbafa14943e6135ef3d8d73de503b04ae57');
+      }
+      
+      console.log('✓ Using secp256k1 curve for all private keys');
+      
       const receiverAddress = await rl.question('Receiver address: ');
       if (!receiverAddress.trim()) {
         throw new Error('Receiver address is required');
+      }
+      
+      // Validate receiver address format
+      const cleanReceiver = receiverAddress.trim();
+      try {
+        Principal.fromText(cleanReceiver);
+        console.log('✓ Principal format detected');
+      } catch (error) {
+        if (cleanReceiver.length === 64 && /^[0-9a-fA-F]+$/.test(cleanReceiver)) {
+          console.log('✓ AccountIdentifier format detected');
+        } else {
+          console.warn('⚠️  Receiver address format may be invalid. Expected: Principal (e.g., "rdmx6-jaaaa-aaaaa-aaadq-cai") or AccountIdentifier (64 hex characters)');
+        }
       }
       
       const amount = await rl.question('Amount (ICP): ');
@@ -368,10 +505,28 @@ if (process.argv[1]?.endsWith('transaction-generator.js') ||
         throw new Error('Amount is required');
       }
       
+      // Validate amount
+      const amountNum = parseFloat(amount.trim());
+      if (isNaN(amountNum) || amountNum <= 0) {
+        throw new Error('Amount must be a positive number');
+      }
+      if (amountNum < 0.00000001) {
+        throw new Error('Amount too small (minimum: 0.00000001 ICP)');
+      }
+      
       const memo = await rl.question('Memo (optional): ');
+      
+      // Validate memo if provided
+      if (memo.trim() !== '') {
+        const memoNum = parseInt(memo.trim(), 10);
+        if (isNaN(memoNum) || memoNum < 0) {
+          console.warn('Memo should be a positive integer, using timestamp instead');
+        }
+      }
       
       // Execute transaction
       console.log('\nProcessing transaction...');
+      
       const result = await generator.sendTransaction(
         privateKey.trim(),
         receiverAddress.trim(),
