@@ -3,6 +3,7 @@ import { Secp256k1KeyIdentity } from '@dfinity/identity-secp256k1';
 import { Principal } from '@dfinity/principal';
 import { createInterface } from 'readline/promises';
 import { LedgerCanister, AccountIdentifier } from '@dfinity/ledger-icp';
+import crypto from 'crypto';
 
 export class ICPTransactionGenerator {
   constructor(network = 'mainnet') {
@@ -202,7 +203,7 @@ export class ICPTransactionGenerator {
             `Insufficient balance. Required: ${totalRequired} e8s, Available: ${senderBalance} e8s`
           );
         }
-        console.log(`✓ Balance check passed. Available: ${senderBalance} e8s`);
+        console.log(`Balance check passed. Available: ${senderBalance} e8s`);
       } catch (error) {
         console.warn('Could not check balance, proceeding with transaction:', error.message);
       }
@@ -323,9 +324,21 @@ export class ICPTransactionGenerator {
       }
       
       if (isSuccess) {
+        const transactionHash = this.generateTransactionHash(
+          blockIndex,
+          senderAccountId,
+          receiver.principal ? receiver.principal.toString() : receiver.accountIdentifier.toHex(),
+          amountE8s.toString(),
+          Number(memoValue).toString()
+        );
+        
+        const transactionUrl = this.generateTransactionUrl(blockIndex, this.network);
+        
         return {
           success: true,
           blockIndex: blockIndex.toString(),
+          transactionHash: transactionHash,
+          transactionUrl: transactionUrl,
           senderAccount: senderAccountId,
           receiverAccount: receiver.principal ? receiver.principal.toString() : receiver.accountIdentifier.toHex(),
           receiverType: receiver.type,
@@ -378,6 +391,47 @@ export class ICPTransactionGenerator {
       accountIdentifier: this.getAccountIdentifier(identity),
       curve: 'secp256k1'
     };
+  }
+
+  /**
+   * Generate transaction hash from block index and transaction details
+   * @param {string|number|bigint} blockIndex - Transaction block index
+   * @param {string} senderAccount - Sender account identifier
+   * @param {string} receiverAccount - Receiver account identifier
+   * @param {string} amountE8s - Amount in e8s
+   * @param {string} memo - Transaction memo
+   * @returns {string} Transaction hash
+   */
+  generateTransactionHash(blockIndex, senderAccount, receiverAccount, amountE8s, memo) {
+    // Create a deterministic hash based on transaction data
+    
+    const hashData = [
+      blockIndex.toString(),
+      senderAccount,
+      receiverAccount,
+      amountE8s.toString(),
+      memo.toString(),
+      'icp-ledger'
+    ].join(':');
+    
+    const hash = crypto.createHash('sha256').update(hashData).digest('hex');
+    return `0x${hash}`;
+  }
+
+  /**
+   * Generate transaction explorer URL
+   * @param {string|number|bigint} blockIndex - Transaction block index
+   * @param {string} network - Network (mainnet/local)
+   * @returns {string} Transaction explorer URL
+   */
+  generateTransactionUrl(blockIndex, network = 'mainnet') {
+    if (network === 'mainnet') {
+      // ICP Dashboard - most popular ICP explorer
+      return `https://dashboard.internetcomputer.org/transaction/${blockIndex}`;
+    } else {
+      // For local network, return a placeholder or local explorer if available
+      return `http://localhost:8080/transaction/${blockIndex}`;
+    }
   }
 }
 
@@ -477,10 +531,10 @@ if (process.argv[1]?.endsWith('transaction-generator.js') ||
       // Validate private key format
       const cleanPrivateKey = privateKey.trim().replace(/^0x/, '');
       if (cleanPrivateKey.length !== 64 || !/^[0-9a-fA-F]+$/.test(cleanPrivateKey)) {
-        throw new Error('Private key must be 64 hex characters (32 bytes). Example: 6239bd6982d3869a7d11a540bcc68dbafa14943e6135ef3d8d73de503b04ae57');
+        throw new Error('Private key must be 64 hex characters (32 bytes).');
       }
       
-      console.log('✓ Using secp256k1 curve for all private keys');
+      console.log('Using secp256k1 curve for all private keys');
       
       const receiverAddress = await rl.question('Receiver address: ');
       if (!receiverAddress.trim()) {
@@ -491,12 +545,12 @@ if (process.argv[1]?.endsWith('transaction-generator.js') ||
       const cleanReceiver = receiverAddress.trim();
       try {
         Principal.fromText(cleanReceiver);
-        console.log('✓ Principal format detected');
+        console.log('Principal format detected');
       } catch (error) {
         if (cleanReceiver.length === 64 && /^[0-9a-fA-F]+$/.test(cleanReceiver)) {
-          console.log('✓ AccountIdentifier format detected');
+          console.log('AccountIdentifier format detected');
         } else {
-          console.warn('⚠️  Receiver address format may be invalid. Expected: Principal (e.g., "rdmx6-jaaaa-aaaaa-aaadq-cai") or AccountIdentifier (64 hex characters)');
+          console.warn('Receiver address format may be invalid. Expected: Principal (e.g., "rdmx6-jaaaa-aaaaa-aaadq-cai") or AccountIdentifier (64 hex characters)');
         }
       }
       
@@ -538,6 +592,7 @@ if (process.argv[1]?.endsWith('transaction-generator.js') ||
       console.log('\nTransaction Summary:');
       console.log(`Status: SUCCESS`);
       console.log(`Block Index: ${result.blockIndex}`);
+      console.log(`Transaction URL: ${result.transactionUrl}`);
       console.log(`From: ${result.senderAccount}`);
       console.log(`To: ${result.receiverAccount}`);
       console.log(`Amount: ${result.amount} ICP`);
